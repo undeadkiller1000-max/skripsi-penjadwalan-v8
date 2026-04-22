@@ -955,12 +955,30 @@ else:
 
                 st.divider()
 
-                # [C] Visualisasi OPC + Gantt untuk 1 order sample
-                st.markdown(f"#### [2] Verifikasi Presedensi — Contoh Order: `{sc['sample_job_id']}`")
-                st.caption("Satu order dipilih secara acak sebagai representasi untuk membuktikan urutan stasiun benar.")
+                # [C] Visualisasi OPC + Gantt — user bisa pilih order sendiri
+                st.markdown("#### [2] Verifikasi Presedensi")
 
-                sr   = sc['sample_row']
-                rute = sc['sample_rute']
+                all_job_ids = list(set(t['job'] for t in jadwal_final))
+
+                # Default ke sample acak dari sanity check, tapi user bisa override
+                if "selected_job_presedensi" not in st.session_state or                         st.session_state["selected_job_presedensi"] not in all_job_ids:
+                    st.session_state["selected_job_presedensi"] = sc["sample_job_id"]
+
+                selected_job = st.selectbox(
+                    "🔍 Pilih Order untuk diperiksa:",
+                    options=all_job_ids,
+                    index=all_job_ids.index(st.session_state["selected_job_presedensi"]),
+                    key="selected_job_presedensi",
+                    help="Pilih ID order yang ingin diverifikasi urutan stasiunnya.",
+                )
+
+                # Ambil data order yang dipilih
+                selected_row_df = df_pool[df_pool["id pesanan"].astype(str) == selected_job]
+                sr   = selected_row_df.iloc[0].to_dict() if not selected_row_df.empty else {}
+                rute = [t["m"] for t in sorted(
+                    [t for t in jadwal_final if t["job"] == selected_job],
+                    key=lambda x: x["start"]
+                )]
 
                 # Spesifikasi order sample
                 if sr:
@@ -987,7 +1005,7 @@ else:
 
                     with col_spec2:
                         st.markdown("**Routing Aktif (OPC):**")
-                        p_sample = P.get(sc['sample_job_id'], {})
+                        p_sample = P.get(selected_job, {})
                         opc_rows = []
                         for idx_r, m in enumerate(rute):
                             opc_rows.append({
@@ -1000,7 +1018,7 @@ else:
                 # OPC diagram (flow horizontal)
                 if rute:
                     st.markdown("**Operation Process Chart (OPC) — Flow Stasiun:**")
-                    p_sample = P.get(sc['sample_job_id'], {})
+                    p_sample = P.get(selected_job, {})
                     opc_fig = go.Figure()
                     n   = len(rute)
                     xs  = list(range(n))
@@ -1049,8 +1067,11 @@ else:
                     st.plotly_chart(opc_fig, use_container_width=True)
 
                 # Gantt chart satu order sample
-                st.markdown(f"**Gantt Chart Order `{sc['sample_job_id']}` dalam Jadwal Final:**")
-                sched_sample = sc['sample_sched']
+                st.markdown(f"**Gantt Chart Order `{selected_job}` dalam Jadwal Final:**")
+                sched_sample = sorted(
+                    [t for t in jadwal_final if t['job'] == selected_job],
+                    key=lambda x: x['start']
+                )
                 if sched_sample:
                     rows_s = []
                     for t in sched_sample:
@@ -1067,7 +1088,7 @@ else:
                         x_start="Mulai", x_end="Selesai",
                         y="Stasiun", color="Stasiun",
                         hover_data=["Durasi (Menit)"],
-                        title=f"Alur Proses Order {sc['sample_job_id']}",
+                        title=f"Alur Proses Order {selected_job}",
                         color_discrete_sequence=px.colors.qualitative.Set2,
                     )
                     fig_sample.update_yaxes(categoryorder="array", categoryarray=rute[::-1])
