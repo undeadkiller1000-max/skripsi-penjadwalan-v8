@@ -115,6 +115,7 @@ def load_order_file(uploaded_file):
         if inv:
             raise ValueError(f"Kolom '{col}' hanya boleh 0 atau 1. Nilai: {inv}")
 
+    df['_urutan_dataset'] = range(len(df))
     return df
 
 
@@ -531,24 +532,54 @@ else:
         with st.container(border=True):
             c1, c2 = st.columns(2)
             bulan_pilih = c1.selectbox("Filter Bulan Due Date:", ["Semua"] + list(df['Bulan-Tahun'].unique()))
-            sortir      = c2.selectbox("Urutkan:", ["Due Date Terdekat", "Due Date Terjauh"])
+            sortir      = c2.selectbox("Urutkan:", ["Default", "Due Date Terdekat", "Due Date Terjauh"])
 
         df_disp = df.copy() if bulan_pilih == "Semua" else df[df['Bulan-Tahun'] == bulan_pilih].copy()
-        df_disp = df_disp.sort_values('due date (tanggal)', ascending=(sortir == "Due Date Terdekat"))
+        if sortir == "Due Date Terdekat":
+            df_disp = df_disp.sort_values('due date (tanggal)', ascending=True)
+        elif sortir == "Due Date Terjauh":
+            df_disp = df_disp.sort_values('due date (tanggal)', ascending=False)
+        else:
+            df_disp = df_disp.sort_values('_urutan_dataset', ascending=True)
 
-        for col, default in [("Pilih", False), ("Priority", False)]:
-            if col not in df_disp.columns:
-                df_disp.insert(0 if col == "Pilih" else 1, col, default)
+        if 'pilih_order_map' not in st.session_state:
+            st.session_state['pilih_order_map'] = {str(x): False for x in df['id pesanan'].astype(str)}
+        else:
+            for oid in df['id pesanan'].astype(str):
+                st.session_state['pilih_order_map'].setdefault(str(oid), False)
+
+        if 'priority_order_map' not in st.session_state:
+            st.session_state['priority_order_map'] = {str(x): False for x in df['id pesanan'].astype(str)}
+        else:
+            for oid in df['id pesanan'].astype(str):
+                st.session_state['priority_order_map'].setdefault(str(oid), False)
+
+        df_disp.insert(0, "Priority", df_disp['id pesanan'].astype(str).map(st.session_state['priority_order_map']).fillna(False))
+        df_disp.insert(0, "Pilih", df_disp['id pesanan'].astype(str).map(st.session_state['pilih_order_map']).fillna(False))
 
         st.subheader("📋 Pemilihan & Prioritisasi Order")
         st.info("💡 Centang **Pilih** untuk memasukkan order ke dalam proses optimasi. "
                 "Centang **Priority** untuk memberi bobot penalti lebih tinggi (order VIP).")
 
+        a1, a2, a3 = st.columns([1, 1, 3])
+        if a1.button("✅ Pilih Semua yang Tampil", use_container_width=True):
+            for oid in df_disp['id pesanan'].astype(str):
+                st.session_state['pilih_order_map'][oid] = True
+        if a2.button("🧹 Hapus Pilihan yang Tampil", use_container_width=True):
+            for oid in df_disp['id pesanan'].astype(str):
+                st.session_state['pilih_order_map'][oid] = False
+
         edited_df = st.data_editor(
-            df_disp.drop(columns=['Bulan-Tahun']),
+            df_disp.drop(columns=['Bulan-Tahun', '_urutan_dataset']),
             hide_index=True,
             use_container_width=True,
         )
+
+        for _, row in edited_df.iterrows():
+            oid = str(row['id pesanan'])
+            st.session_state['pilih_order_map'][oid] = bool(row['Pilih'])
+            st.session_state['priority_order_map'][oid] = bool(row['Priority'])
+
         df_pool = edited_df[edited_df["Pilih"] == True].copy()
 
         # ============================================================
