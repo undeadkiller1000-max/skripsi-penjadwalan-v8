@@ -548,21 +548,29 @@ else:
         st.info("💡 Centang **Pilih** untuk memasukkan order ke dalam proses optimasi. "
                 "Centang **Priority** untuk memberi bobot penalti lebih tinggi (order VIP).")
 
-        # Tombol Pilih Semua / Batal Semua
-        col_sel1, col_sel2, _ = st.columns([1, 1, 4])
-        pilih_semua  = col_sel1.button("☑️ Pilih Semua", use_container_width=True)
-        batal_semua  = col_sel2.button("⬜ Batal Semua", use_container_width=True)
+        # Tombol Pilih Semua / Batal Semua — gunakan session_state agar
+        # state centang tidak hilang saat Streamlit rerun setelah klik tombol
+        if "pilih_semua_state" not in st.session_state:
+            st.session_state["pilih_semua_state"] = None
 
-        if pilih_semua:
-            df_disp["Pilih"] = True
-        if batal_semua:
-            df_disp["Pilih"] = False
+        col_sel1, col_sel2, _ = st.columns([1, 1, 4])
+        if col_sel1.button("☑️ Pilih Semua", use_container_width=True):
+            st.session_state["pilih_semua_state"] = True
+        if col_sel2.button("⬜ Batal Semua", use_container_width=True):
+            st.session_state["pilih_semua_state"] = False
+
+        if st.session_state["pilih_semua_state"] is not None:
+            df_disp["Pilih"] = st.session_state["pilih_semua_state"]
 
         edited_df = st.data_editor(
             df_disp.drop(columns=['Bulan-Tahun']),
             hide_index=True,
             use_container_width=True,
         )
+
+        # Setelah user mengedit manual, reset override agar tidak mengunci terus
+        st.session_state["pilih_semua_state"] = None
+
         df_pool = edited_df[edited_df["Pilih"] == True].copy()
 
         # ============================================================
