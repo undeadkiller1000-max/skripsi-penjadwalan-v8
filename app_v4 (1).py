@@ -115,7 +115,6 @@ def load_order_file(uploaded_file):
         if inv:
             raise ValueError(f"Kolom '{col}' hanya boleh 0 atau 1. Nilai: {inv}")
 
-    df['_urutan_dataset'] = range(len(df))
     return df
 
 
@@ -539,47 +538,31 @@ else:
             df_disp = df_disp.sort_values('due date (tanggal)', ascending=True)
         elif sortir == "Due Date Terjauh":
             df_disp = df_disp.sort_values('due date (tanggal)', ascending=False)
-        else:
-            df_disp = df_disp.sort_values('_urutan_dataset', ascending=True)
+        # "Default" → tidak diurutkan, biarkan sesuai urutan dataset
 
-        if 'pilih_order_map' not in st.session_state:
-            st.session_state['pilih_order_map'] = {str(x): False for x in df['id pesanan'].astype(str)}
-        else:
-            for oid in df['id pesanan'].astype(str):
-                st.session_state['pilih_order_map'].setdefault(str(oid), False)
-
-        if 'priority_order_map' not in st.session_state:
-            st.session_state['priority_order_map'] = {str(x): False for x in df['id pesanan'].astype(str)}
-        else:
-            for oid in df['id pesanan'].astype(str):
-                st.session_state['priority_order_map'].setdefault(str(oid), False)
-
-        df_disp.insert(0, "Priority", df_disp['id pesanan'].astype(str).map(st.session_state['priority_order_map']).fillna(False))
-        df_disp.insert(0, "Pilih", df_disp['id pesanan'].astype(str).map(st.session_state['pilih_order_map']).fillna(False))
+        for col, default in [("Pilih", False), ("Priority", False)]:
+            if col not in df_disp.columns:
+                df_disp.insert(0 if col == "Pilih" else 1, col, default)
 
         st.subheader("📋 Pemilihan & Prioritisasi Order")
         st.info("💡 Centang **Pilih** untuk memasukkan order ke dalam proses optimasi. "
                 "Centang **Priority** untuk memberi bobot penalti lebih tinggi (order VIP).")
 
-        a1, a2, a3 = st.columns([1, 1, 3])
-        if a1.button("✅ Pilih Semua yang Tampil", use_container_width=True):
-            for oid in df_disp['id pesanan'].astype(str):
-                st.session_state['pilih_order_map'][oid] = True
-        if a2.button("🧹 Hapus Pilihan yang Tampil", use_container_width=True):
-            for oid in df_disp['id pesanan'].astype(str):
-                st.session_state['pilih_order_map'][oid] = False
+        # Tombol Pilih Semua / Batal Semua
+        col_sel1, col_sel2, _ = st.columns([1, 1, 4])
+        pilih_semua  = col_sel1.button("☑️ Pilih Semua", use_container_width=True)
+        batal_semua  = col_sel2.button("⬜ Batal Semua", use_container_width=True)
+
+        if pilih_semua:
+            df_disp["Pilih"] = True
+        if batal_semua:
+            df_disp["Pilih"] = False
 
         edited_df = st.data_editor(
-            df_disp.drop(columns=['Bulan-Tahun', '_urutan_dataset']),
+            df_disp.drop(columns=['Bulan-Tahun']),
             hide_index=True,
             use_container_width=True,
         )
-
-        for _, row in edited_df.iterrows():
-            oid = str(row['id pesanan'])
-            st.session_state['pilih_order_map'][oid] = bool(row['Pilih'])
-            st.session_state['priority_order_map'][oid] = bool(row['Priority'])
-
         df_pool = edited_df[edited_df["Pilih"] == True].copy()
 
         # ============================================================
@@ -810,13 +793,13 @@ else:
             with st.container(border=True):
                 cc1, cc2 = st.columns(2)
                 cc1.markdown(
-                    f'<div style="background:#DCFCE7;padding:12px;border-radius:10px">'
+                    f'<div style="background:#166534;padding:12px;border-radius:10px;color:white">'
                     f'<b>🏆 {label_pemenang}</b><br>'
                     f'Skor Penalti: <b>{score_pemenang:,.2f}</b>'
                     f'</div>', unsafe_allow_html=True
                 )
                 cc2.markdown(
-                    f'<div style="background:#FEE2E2;padding:12px;border-radius:10px">'
+                    f'<div style="background:#991B1B;padding:12px;border-radius:10px;color:white">'
                     f'<b>🔻 {label_kalah}</b><br>'
                     f'Skor Penalti: <b>{"N/A" if score_kalah == float("inf") else f"{score_kalah:,.2f}"}</b><br>'
                     f'MILP Status: {milp_status}'
@@ -1021,8 +1004,13 @@ else:
                             x=xi, y=-0.18,
                             text=f"<b>{short_m}</b><br>{d:.1f} mnt",
                             showarrow=False,
-                            font=dict(size=10, color='#1E3A8A'),
+                            font=dict(size=10, color='white'),
                             align='center',
+                            bgcolor='#1E3A8A',
+                            borderpad=3,
+                            bordercolor='#1E3A8A',
+                            borderwidth=1,
+                            opacity=0.9,
                         )
                         if xi < n - 1:
                             opc_fig.add_annotation(
