@@ -548,28 +548,38 @@ else:
         st.info("💡 Centang **Pilih** untuk memasukkan order ke dalam proses optimasi. "
                 "Centang **Priority** untuk memberi bobot penalti lebih tinggi (order VIP).")
 
-        # Tombol Pilih Semua / Batal Semua — gunakan session_state agar
-        # state centang tidak hilang saat Streamlit rerun setelah klik tombol
-        if "pilih_semua_state" not in st.session_state:
-            st.session_state["pilih_semua_state"] = None
+        # Tombol Pilih Semua / Batal Semua
+        # Strategi: simpan DataFrame hasil edit di session_state sebagai sumber kebenaran.
+        # Tombol memodifikasi session_state SEBELUM data_editor dirender,
+        # sehingga state tetap konsisten saat Run ditekan (rerun berikutnya).
+
+        editor_key = "order_editor"
+
+        # Inisialisasi state tabel jika belum ada atau kolom berubah
+        if "df_editor_state" not in st.session_state or                 set(st.session_state["df_editor_state"].columns) != set(df_disp.drop(columns=["Bulan-Tahun"]).columns):
+            st.session_state["df_editor_state"] = df_disp.drop(columns=["Bulan-Tahun"]).copy()
+
+        # Sinkronkan baris jika filter/sort berubah (baris bisa bertambah/berkurang)
+        current_ids = df_disp["id pesanan"].astype(str).tolist()
+        stored_ids  = st.session_state["df_editor_state"]["id pesanan"].astype(str).tolist()
+        if current_ids != stored_ids:
+            st.session_state["df_editor_state"] = df_disp.drop(columns=["Bulan-Tahun"]).copy()
 
         col_sel1, col_sel2, _ = st.columns([1, 1, 4])
         if col_sel1.button("☑️ Pilih Semua", use_container_width=True):
-            st.session_state["pilih_semua_state"] = True
+            st.session_state["df_editor_state"]["Pilih"] = True
         if col_sel2.button("⬜ Batal Semua", use_container_width=True):
-            st.session_state["pilih_semua_state"] = False
-
-        if st.session_state["pilih_semua_state"] is not None:
-            df_disp["Pilih"] = st.session_state["pilih_semua_state"]
+            st.session_state["df_editor_state"]["Pilih"] = False
 
         edited_df = st.data_editor(
-            df_disp.drop(columns=['Bulan-Tahun']),
+            st.session_state["df_editor_state"],
+            key=editor_key,
             hide_index=True,
             use_container_width=True,
         )
 
-        # Setelah user mengedit manual, reset override agar tidak mengunci terus
-        st.session_state["pilih_semua_state"] = None
+        # Simpan hasil edit manual kembali ke session_state
+        st.session_state["df_editor_state"] = edited_df.copy()
 
         df_pool = edited_df[edited_df["Pilih"] == True].copy()
 
