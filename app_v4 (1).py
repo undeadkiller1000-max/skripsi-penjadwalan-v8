@@ -502,11 +502,13 @@ def jalankan_sanity_check(jadwal_final, df_pool, P_dict, start_date):
 
     log.append("\n[2/3] Memeriksa Presedensi (urutan stasiun per job)...")
     presedens_details = []
-    station_order = {m: idx for idx, m in enumerate(STATIONS)}
+    station_idx = {m: idx for idx, m in enumerate(STATIONS)}
     for job in set(t['job'] for t in jadwal_final):
-        # Sort berdasarkan urutan STATIONS (routing resmi), bukan start time
-        tasks_j = sorted([t for t in jadwal_final if t['job'] == job],
-                         key=lambda x: station_order.get(x['m'], 999))
+        # Sort berdasarkan urutan routing resmi (STATIONS), bukan start time
+        tasks_j = sorted(
+            [t for t in jadwal_final if t['job'] == job],
+            key=lambda x: station_idx.get(x['m'], 999)
+        )
         for i in range(1, len(tasks_j)):
             p, c = tasks_j[i-1], tasks_j[i]
             gap  = c['start'] - (p['start'] + p['dur'])
@@ -963,55 +965,71 @@ else:
                     except Exception:
                         milp_gap_pct = None
 
-                    # ── [FIX-A] Ekstrak urutan job per mesin dari variabel Y biner ──────────
-                    # Gunakan Y[(i,j,m)]=1 berarti job j sebelum job i di mesin m.
-                    # Dari urutan ini kita rekonstruksi jadwal ulang menggunakan
-                    # eval_sequence agar jadwal pasti valid (tidak ada overlap/gap palsu).
-                    # Ini jauh lebih andal daripada langsung pakai varValue S[i][m]
-                    # yang bisa None/0 akibat CBC tidak menetapkan nilai untuk semua variabel.
-                    try:
-                        # Tentukan urutan job per mesin dari Y variables
-                        # Y[(i,j,m)]=1 → i dikerjakan SETELAH j di mesin m
-                        # Kita bangun graph presedensi mesin → topological sort → seq global
-                        from collections import defaultdict, deque
+                    # ── [FIX-A] Ekstrak varValue dan validasi kelayakan jadwal ─────────────
+                    # CBC kadang melaporkan obj_val=0 (feasible) tapi tidak menetapkan
+                    # nilai untuk variabel S[i][m] (varValue=None atau semuanya 0).
+                    # Ini terjadi karena BigM terlalu longgar sehingga constraint
+                    # disjunctive tidak mengikat dan solver menemukan "solusi trivial"
+                    # di mana semua job mulai di t=0.
+                    # Solusi: ekstrak varValue, lalu cek apakah jadwal yang dihasilkan
+                    # secara fisik valid (tidak ada overlap di setiap mesin).
+                    # Jika tidak valid → tolak jadwal MILP, biarkan SA menang.
 
-                        # Kumpulkan urutan relatif job di setiap mesin
-                        mesin_order = defaultdict(list)  # mesin → list of (before, after)
-                        for (i, j, m), y_var in Y.items():
-                            yval = y_var.varValue
-                            if yval is None:
-                                continue
-                            if round(yval) == 1:
-                                # y=1 → S[j][m] >= S[i][m]+P[i][m], artinya i sebelum j
-                                mesin_order[m].append((i, j))
-                            else:
-                                # y=0 → S[i][m] >= S[j][m]+P[j][m], artinya j sebelum i
-                                mesin_order[m].append((j, i))
+                    milp_sched_cand = []
+                    milp_end_cand   = {}
 
-                        # Buat urutan global job berdasarkan vote terbanyak dari semua mesin
-                        # (simple scoring: job yang lebih sering "sebelum" job lain = prioritas tinggi)
-                        score_milp_order = {jid: 0 for jid in job_ids}
-                        for m, edges in mesin_order.items():
-                            for before, after in edges:
-                                score_milp_order[before] += 1
+                    for i in job_ids:
+                        rute = [m for m in STATIONS if P[i][m] > 0]
+                        if not rute:
+                            milp_end_cand[i] = 0.0
+                            continue
+                        max_end_i = 0.0
+                        for m in rute:
+                            raw   = S[i][m].varValue
+                            s_val = round(float(raw), 4) if raw is not None else 0.0
+                            end_m = s_val + P[i][m]
+                            if end_m > max_end_i:
+                                max_end_i = end_m
+                            milp_sched_cand.append({
+                                'job'  : i,
+                                'm'    : m,
+                                'start': s_val,
+                                'dur'  : P[i][m],
+                            })
+                        milp_end_cand[i] = max_end_i
 
-                        milp_seq = sorted(job_ids, key=lambda x: -score_milp_order[x])
+                    # Validasi: cek overlap mesin pada jadwal kandidat MILP
+                    # (sama persis dengan logika sanity check, tapi ringan dan lokal)
+                    MILP_TOL = 0.01
+                    milp_valid = True
+                    for stn in STATIONS:
+                        tasks_stn = sorted(
+                            [t for t in milp_sched_cand if t['m'] == stn],
+                            key=lambda x: x['start']
+                        )
+                        for k in range(1, len(tasks_stn)):
+                            gap = tasks_stn[k]['start'] - (tasks_stn[k-1]['start'] + tasks_stn[k-1]['dur'])
+                            if gap < -MILP_TOL:
+                                milp_valid = False
+                                break
+                        if not milp_valid:
+                            break
 
-                        # Rekonstruksi jadwal menggunakan eval_sequence dengan urutan MILP
-                        milp_score_recheck, milp_sched, milp_end_dict = eval_sequence(
-                            milp_seq, P, D, W)
-                        milp_end = milp_end_dict
-
-                        # Gunakan skor dari MILP objective (lebih akurat) tapi jadwal dari rekonstruksi
-                        # Jika rekonstruksi menghasilkan skor lebih baik dari SA, pakai MILP seq
-                        # Jika tidak, biarkan SA menang di tahap showdown berikutnya
-                        milp_score = min(milp_score, milp_score_recheck)
-
-                    except Exception:
-                        # Fallback: jika rekonstruksi gagal, MILP dianggap tidak feasible
+                    if milp_valid and milp_sched_cand:
+                        # Jadwal MILP valid → terima
+                        milp_sched = milp_sched_cand
+                        milp_end   = milp_end_cand
+                        # Hitung ulang skor aktual dari jadwal (bukan dari obj_val CBC
+                        # yang bisa menipu ketika varValue trivial)
+                        milp_score = sum(
+                            max(0.0, milp_end_cand[i] - D[i]) * W[i]
+                            for i in job_ids
+                        )
+                    else:
+                        # Jadwal MILP tidak valid → tolak, SA yang akan menang
                         milp_feasible = False
-                        milp_sched = []
-                        milp_end   = {}
+                        milp_sched    = []
+                        milp_end      = {}
 
             # Benchmark
             pb.progress(80, "4/5 Benchmark EDD & FCFS…")
