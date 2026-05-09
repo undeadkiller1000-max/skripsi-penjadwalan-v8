@@ -435,6 +435,7 @@ def render_gantt_dual(df_gantt, title, chart_key, height=520):
             df_gantt, x_start="Mulai", x_end="Selesai",
             y="Stasiun Kerja", color="ID Pesanan",
             color_discrete_map=color_map,
+            text="ID Pesanan",
             hover_data=["ID Pesanan", "Durasi (Menit)", "Qty", "Status"],
             title=title,
         )
@@ -444,12 +445,13 @@ def render_gantt_dual(df_gantt, title, chart_key, height=520):
             df_gantt, x_start="Mulai", x_end="Selesai",
             y="Stasiun Kerja", color="Status",
             color_discrete_map=color_map,
+            text="ID Pesanan",
             hover_data=["ID Pesanan", "Durasi (Menit)", "Qty"],
             title=title,
         )
         fig.update_layout(legend_title_text='Status Ketepatan')
 
-    fig.update_traces(text=df_gantt['ID Pesanan'], textposition='inside', insidetextanchor='middle')
+    fig.update_traces(textposition='inside', insidetextanchor='middle')
     fig.update_yaxes(categoryorder="array", categoryarray=STATIONS[::-1])
     fig.update_layout(height=height, plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)')
     st.plotly_chart(fig, use_container_width=True, key=f"chart_{chart_key}_{mode}")
@@ -500,8 +502,11 @@ def jalankan_sanity_check(jadwal_final, df_pool, P_dict, start_date):
 
     log.append("\n[2/3] Memeriksa Presedensi (urutan stasiun per job)...")
     presedens_details = []
+    station_order = {m: idx for idx, m in enumerate(STATIONS)}
     for job in set(t['job'] for t in jadwal_final):
-        tasks_j = sorted([t for t in jadwal_final if t['job'] == job], key=lambda x: x['start'])
+        # Urutkan berdasarkan urutan STATIONS (routing), bukan start time
+        tasks_j = sorted([t for t in jadwal_final if t['job'] == job],
+                         key=lambda x: station_order.get(x['m'], 999))
         for i in range(1, len(tasks_j)):
             p, c = tasks_j[i-1], tasks_j[i]
             gap  = c['start'] - (p['start'] + p['dur'])
@@ -962,21 +967,26 @@ else:
                     # varValue bisa None untuk variabel yang tidak terkait constraint aktif.
                     # round() ke 4 desimal (bukan 2) untuk menjaga presisi agar sanity check
                     # (threshold -0.01) tidak terpicu oleh rounding error CBC.
+                    sa_map_milp = {(e['job'], e['m']): e['start'] for e in sa_sched}
                     for i in job_ids:
                         rute = [m for m in STATIONS if P[i][m] > 0]
                         if not rute:
                             milp_end[i] = 0
                             continue
-                        end_i = 0.0
+                        max_end_i = 0.0
                         for m in rute:
                             raw = S[i][m].varValue
-                            # Guard: jika varValue None (solver tidak menetapkan nilai),
-                            # fallback ke 0. Ini aman karena constraint presedensi
-                            # menjamin nilai yang benar jika solver feasible.
-                            s_val = float(raw) if raw is not None else 0.0
-                            # Simpan tanpa round dulu — round hanya saat append ke sched
-                            # supaya perhitungan end_i tetap presisi
-                            end_i = s_val + P[i][m]
+                            if raw is None:
+                                # varValue None: solver tidak menetapkan nilai untuk variabel ini.
+                                # Gunakan nilai SA sebagai fallback yang lebih aman daripada 0,
+                                # agar sanity check tidak melaporkan overlap palsu.
+                                s_val = float(sa_map_milp.get((i, m), 0.0))
+                            else:
+                                s_val = float(raw)
+                            end_m = s_val + P[i][m]
+                            # [FIX] Track end time MAKSIMUM di seluruh stasiun job ini
+                            if end_m > max_end_i:
+                                max_end_i = end_m
                             milp_sched.append({
                                 'job'  : i,
                                 'm'    : m,
@@ -984,7 +994,7 @@ else:
                                 'start': round(s_val, 4),
                                 'dur'  : P[i][m],
                             })
-                        milp_end[i] = end_i
+                        milp_end[i] = max_end_i
 
             # Benchmark
             pb.progress(80, "4/5 Benchmark EDD & FCFS…")
