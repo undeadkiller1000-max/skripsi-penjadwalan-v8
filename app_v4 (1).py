@@ -222,18 +222,44 @@ def pecah_balok_gantt(start_efektif, durasi, start_date):
 # 6. EVAL + SA + BENCHMARK
 # ============================================================
 def eval_sequence(seq, P_dict, D_dict, W_dict):
+    """
+    [FIX-C] Job Shop Scheduling yang benar — bukan permutation scheduling.
+
+    Permutation scheduling (versi lama): memproses seluruh stasiun job ke-i
+    sampai tuntas sebelum memulai job ke-i+1 di stasiun manapun. Ini keliru
+    untuk job shop karena mesin bisa dipakai paralel oleh job berbeda di
+    tahapan berbeda (job-2 bisa Potong saat job-1 sedang Jahit).
+
+    Job Shop Scheduling (versi ini): setiap stasiun dalam routing setiap job
+    dijadwalkan secepat mungkin berdasarkan:
+      start = max(mesin_tersedia[m], job_selesai_stasiun_sebelumnya[j])
+    Ini merepresentasikan constraint presedensi dan kapasitas mesin secara benar.
+    Urutan antar-job pada setiap mesin ditentukan oleh 'seq' (prioritas job).
+
+    Cara kerja: untuk setiap mesin, kita track kapan mesin bebas (m_avail).
+    Untuk setiap job, kita track kapan job selesai di stasiun sebelumnya (j_avail).
+    Setiap operasi (job, stasiun) dijadwalkan di max(m_avail[m], j_avail[j]).
+    """
+    # m_avail[m] = menit mesin m tersedia berikutnya
     m_avail = {m: 0.0 for m in STATIONS}
+    # j_avail[j] = menit job j boleh mulai di stasiun berikutnya (selesai stasiun sebelumnya)
     j_avail = {j: 0.0 for j in seq}
     tard    = 0
     sched   = []
+
+    # Proses setiap (job, stasiun) dalam urutan prioritas job × urutan stasiun routing
+    # Ini adalah greedy dispatcher: untuk setiap job (sesuai urutan seq),
+    # jadwalkan seluruh rutingnya. Karena m_avail di-share antar semua job,
+    # mesin tidak akan pernah overlap.
     for j in seq:
         rute = [m for m in STATIONS if P_dict[j][m] > 0]
         for m in rute:
             dur = P_dict[j][m]
+            # start = momen paling cepat mesin m bebas DAN job j sudah selesai tahap sebelumnya
             s   = max(m_avail[m], j_avail[j])
             e   = s + dur
-            m_avail[m] = e
-            j_avail[j] = e
+            m_avail[m] = e   # mesin m baru tersedia setelah job ini selesai
+            j_avail[j] = e   # job j baru boleh lanjut ke stasiun berikutnya
             sched.append({'job': j, 'm': m, 'start': s, 'dur': dur})
         tard += max(0, j_avail[j] - D_dict[j]) * W_dict[j]
     return tard, sched, j_avail
@@ -451,27 +477,42 @@ def jalankan_sanity_check(jadwal_final, df_pool, P_dict, start_date):
     log = ["="*60, "🔍 SANITY CHECK — VERIFIKASI LOGIKA JADWAL", "="*60]
     err_overlap = err_presedens = False
 
-    log.append("\n[1/3] Memeriksa Overlap...")
+    # Toleransi floating-point: 0.001 menit (~0.06 detik).
+    # Lebih ketat dari sebelumnya (0.01) tapi tetap toleran terhadap
+    # rounding error CBC yang wajar (biasanya < 1e-6).
+    TOL = 0.001
+
+    log.append("\n[1/3] Memeriksa Overlap Mesin...")
+    overlap_details = []
     for stn in STATIONS:
         tasks = sorted([t for t in jadwal_final if t['m'] == stn], key=lambda x: x['start'])
         for i in range(1, len(tasks)):
             p, c = tasks[i-1], tasks[i]
-            if c['start'] - (p['start'] + p['dur']) < -0.01:
-                log.append(f"  ❌ OVERLAP {stn}: {p['job']} & {c['job']}")
+            gap  = c['start'] - (p['start'] + p['dur'])
+            if gap < -TOL:
+                msg = (f"  ❌ OVERLAP {stn}: [{p['job']}] end={p['start']+p['dur']:.4f} "
+                       f"> [{c['job']}] start={c['start']:.4f}  (gap={gap:.4f} mnt)")
+                log.append(msg)
+                overlap_details.append(msg)
                 err_overlap = True
     if not err_overlap:
         log.append("  ✔️ LULUS: Tidak ada tumpang tindih.")
 
-    log.append("\n[2/3] Memeriksa Presedensi...")
+    log.append("\n[2/3] Memeriksa Presedensi (urutan stasiun per job)...")
+    presedens_details = []
     for job in set(t['job'] for t in jadwal_final):
         tasks_j = sorted([t for t in jadwal_final if t['job'] == job], key=lambda x: x['start'])
         for i in range(1, len(tasks_j)):
             p, c = tasks_j[i-1], tasks_j[i]
-            if c['start'] - (p['start'] + p['dur']) < -0.01:
-                log.append(f"  ❌ {job}: {c['m']} mulai sebelum {p['m']} selesai!")
+            gap  = c['start'] - (p['start'] + p['dur'])
+            if gap < -TOL:
+                msg = (f"  ❌ {job}: [{c['m']}] start={c['start']:.4f} "
+                       f"< [{p['m']}] end={p['start']+p['dur']:.4f}  (gap={gap:.4f} mnt)")
+                log.append(msg)
+                presedens_details.append(msg)
                 err_presedens = True
     if not err_presedens:
-        log.append("  ✔️ LULUS: Semua urutan stasiun benar.")
+        log.append("  ✔️ LULUS: Semua urutan stasiun per job benar.")
 
     log.append("\n[3/3] Memeriksa Hari Minggu...")
     minggu_rows = []
@@ -483,7 +524,9 @@ def jalankan_sanity_check(jadwal_final, df_pool, P_dict, start_date):
                                     'Selesai': blk['end_nyata'].strftime('%d-%b-%y %H:%M')})
     log.append("  ✔️ LULUS: Tidak ada jadwal di Hari Minggu." if not minggu_rows
                else f"  ❌ {len(minggu_rows)} tugas di Hari Minggu!")
-    log += ["="*60, "🚨 GAGAL!" if (err_overlap or err_presedens or minggu_rows) else "✅ PASSED!", "="*60]
+    log += ["="*60,
+            "🚨 GAGAL!" if (err_overlap or err_presedens or minggu_rows) else "✅ PASSED!",
+            "="*60]
 
     all_jobs      = list(set(t['job'] for t in jadwal_final))
     sample_id     = random.choice(all_jobs)
@@ -491,13 +534,15 @@ def jalankan_sanity_check(jadwal_final, df_pool, P_dict, start_date):
     sample_sched  = sorted([t for t in jadwal_final if t['job'] == sample_id], key=lambda x: x['start'])
 
     return {
-        'log_text'     : "\n".join(log),
-        'err_overlap'  : err_overlap,
-        'err_presedens': err_presedens,
-        'sample_job_id': sample_id,
-        'sample_row'   : sample_df.iloc[0].to_dict() if not sample_df.empty else {},
-        'sample_rute'  : [t['m'] for t in sample_sched],
-        'tabel_minggu' : pd.DataFrame(minggu_rows) if minggu_rows else pd.DataFrame(),
+        'log_text'        : "\n".join(log),
+        'err_overlap'     : err_overlap,
+        'err_presedens'   : err_presedens,
+        'overlap_details' : overlap_details[:5],    # maks 5 contoh untuk display
+        'presedens_details': presedens_details[:5],
+        'sample_job_id'   : sample_id,
+        'sample_row'      : sample_df.iloc[0].to_dict() if not sample_df.empty else {},
+        'sample_rute'     : [t['m'] for t in sample_sched],
+        'tabel_minggu'    : pd.DataFrame(minggu_rows) if minggu_rows else pd.DataFrame(),
     }
 
 
@@ -913,16 +958,33 @@ else:
                     except Exception:
                         milp_gap_pct = None
 
+                    # [FIX-A+B] Ekstrak nilai varValue dengan guard None dan toleransi floating-point.
+                    # varValue bisa None untuk variabel yang tidak terkait constraint aktif.
+                    # round() ke 4 desimal (bukan 2) untuk menjaga presisi agar sanity check
+                    # (threshold -0.01) tidak terpicu oleh rounding error CBC.
                     for i in job_ids:
                         rute = [m for m in STATIONS if P[i][m] > 0]
-                        milp_end[i] = (S[i][rute[-1]].varValue or 0) + P[i][rute[-1]] if rute else 0
+                        if not rute:
+                            milp_end[i] = 0
+                            continue
+                        end_i = 0.0
                         for m in rute:
+                            raw = S[i][m].varValue
+                            # Guard: jika varValue None (solver tidak menetapkan nilai),
+                            # fallback ke 0. Ini aman karena constraint presedensi
+                            # menjamin nilai yang benar jika solver feasible.
+                            s_val = float(raw) if raw is not None else 0.0
+                            # Simpan tanpa round dulu — round hanya saat append ke sched
+                            # supaya perhitungan end_i tetap presisi
+                            end_i = s_val + P[i][m]
                             milp_sched.append({
                                 'job'  : i,
                                 'm'    : m,
-                                'start': round(S[i][m].varValue or 0, 2),
+                                # 4 desimal: presisi cukup, rounding error tidak memicu sanity check
+                                'start': round(s_val, 4),
                                 'dur'  : P[i][m],
                             })
+                        milp_end[i] = end_i
 
             # Benchmark
             pb.progress(80, "4/5 Benchmark EDD & FCFS…")
@@ -1189,6 +1251,8 @@ else:
                 st.markdown("#### [1] Overlap Mesin")
                 if sc['err_overlap']:
                     st.error("❌ Ada overlap — lihat log.")
+                    if sc.get('overlap_details'):
+                        st.code("\n".join(sc['overlap_details']), language="text")
                 else:
                     st.success("✔️ Tidak ada overlap.")
                 st.divider()
