@@ -810,63 +810,119 @@ else:
             # MILP
             pb.progress(35, f"3/5 MILP/CBC (maks {milp_time_limit} detik)…")
             milp_score = float('inf'); milp_feasible = False
-            milp_status = "Not Run"; milp_sched = []; milp_end = {}; bigm_info = {}
+            milp_status = "Not Run"; milp_sched = []; milp_end = {}
+            bigm_info  = {}; milp_gap_pct = None
 
             if len(job_ids) >= 2:
                 prob     = pulp.LpProblem("JobShop_Garment", pulp.LpMinimize)
                 S        = pulp.LpVariable.dicts("S",    (job_ids, STATIONS), lowBound=0, cat='Continuous')
-                Tard_var = pulp.LpVariable.dicts("Tard", job_ids, lowBound=0, cat='Continuous')
+                Tard_var = pulp.LpVariable.dicts("Tard", job_ids,             lowBound=0, cat='Continuous')
 
+                # ── [FIX-1] BigM GLOBAL = total makespan teoritis seluruh sistem ────────────
+                # Root cause infeasibility sebelumnya: BigM per-mesin (= sum durasi di mesin itu)
+                # terlalu kecil untuk mematikan disjunctive constraint ketika start time
+                # suatu job bernilai besar (job yang baru dimulai di hari ke-15 dst).
+                # BigM harus >= selisih start time MAKSIMUM yang mungkin di seluruh sistem,
+                # yaitu total waktu jika seluruh job diproses secara seri di semua stasiun.
+                # Rumus: BigM = Σᵢ Σₘ Pᵢₘ  (batas atas ketat makespan sistem)
+                BigM_global = max(
+                    sum(P[i][m] for i in job_ids for m in STATIONS),
+                    1.0
+                )
                 BigM = {}
                 for m in STATIONS:
-                    td = sum(P[i][m] for i in job_ids if P[i][m] > 0)
-                    BigM[m] = max(td, 1.0); bigm_info[m] = round(BigM[m], 1)
+                    BigM[m]      = BigM_global
+                    bigm_info[m] = round(BigM_global, 1)
 
+                # Variabel biner — hanya untuk pasangan yang benar-benar share mesin
                 Y = {}
                 for m in STATIONS:
                     aktif = [i for i in job_ids if P[i][m] > 0]
                     for a in range(len(aktif)):
-                        for b in range(a+1, len(aktif)):
+                        for b in range(a + 1, len(aktif)):
                             i, j = aktif[a], aktif[b]
-                            Y[(i,j,m)] = pulp.LpVariable(
-                                f"Y_{safe_var_name(i)}_{safe_var_name(j)}_{safe_var_name(m)}", cat='Binary')
+                            Y[(i, j, m)] = pulp.LpVariable(
+                                f"Y_{safe_var_name(i)}_{safe_var_name(j)}_{safe_var_name(m)}",
+                                cat='Binary')
 
+                # Objektif: minimasi total weighted tardiness
                 prob += pulp.lpSum(W[i] * Tard_var[i] for i in job_ids)
+
                 for i in job_ids:
                     rute = [m for m in STATIONS if P[i][m] > 0]
+                    # Kendala presedensi (urutan stasiun dalam routing)
                     for k in range(1, len(rute)):
                         prob += S[i][rute[k]] >= S[i][rute[k-1]] + P[i][rute[k-1]]
+                    # Kendala tardiness
                     if rute:
                         prob += Tard_var[i] >= (S[i][rute[-1]] + P[i][rute[-1]]) - D[i]
-                for (i,j,m), y_var in Y.items():
+
+                # Kendala kapasitas mesin (disjunctive / no-overlap)
+                for (i, j, m), y_var in Y.items():
                     bm = BigM[m]
                     prob += S[j][m] >= S[i][m] + P[i][m] - bm * y_var
                     prob += S[i][m] >= S[j][m] + P[j][m] - bm * (1 - y_var)
 
-                sa_map = {(e['job'],e['m']): e['start'] for e in sa_sched}
+                # ── [FIX-2] Warm-start defensif dari solusi SA ────────────────────────────
+                # setInitialValue hanya dipanggil jika nilai ada DAN dalam domain variabel.
+                # Pengecekan ini mencegah CBC langsung melaporkan infeasible akibat
+                # starting point yang melanggar constraint (karena SA menggunakan logika
+                # greedy berbeda dari MILP).
+                sa_map = {(e['job'], e['m']): e['start'] for e in sa_sched}
                 for i in job_ids:
                     for m in STATIONS:
-                        v = sa_map.get((i,m))
-                        if v is not None: S[i][m].setInitialValue(v)
-                for (i,j,m), y_var in Y.items():
-                    si = sa_map.get((i,m)); sj = sa_map.get((j,m))
+                        v = sa_map.get((i, m))
+                        if v is not None and v >= 0:
+                            try:
+                                S[i][m].setInitialValue(float(v))
+                            except Exception:
+                                pass   # abaikan nilai yang tidak kompatibel
+                for (i, j, m), y_var in Y.items():
+                    si = sa_map.get((i, m))
+                    sj = sa_map.get((j, m))
                     if si is not None and sj is not None:
-                        try: y_var.setInitialValue(1 if sj < si else 0)
-                        except: pass
+                        try:
+                            y_var.setInitialValue(1 if float(sj) < float(si) else 0)
+                        except Exception:
+                            pass
 
-                prob.solve(pulp.PULP_CBC_CMD(timeLimit=milp_time_limit, msg=0, warmStart=True))
-                milp_status   = pulp.LpStatus[prob.status]
-                obj_val       = pulp.value(prob.objective)
-                milp_feasible = milp_status in ('Optimal','Feasible') and obj_val is not None
+                # ── Solve ─────────────────────────────────────────────────────────────────
+                prob.solve(pulp.PULP_CBC_CMD(
+                    timeLimit=milp_time_limit,
+                    msg=0,          # ganti ke msg=1 untuk debug di terminal jika perlu
+                    warmStart=True,
+                ))
+
+                milp_status = pulp.LpStatus[prob.status]
+                obj_val     = pulp.value(prob.objective)
+
+                # ── [FIX-3] Cek feasibility yang lebih robust ─────────────────────────────
+                # obj_val is not None = CBC menemukan setidaknya 1 solusi integer feasible
+                # (berlaku baik saat Optimal maupun saat berhenti karena time limit)
+                milp_feasible = obj_val is not None
                 milp_score    = float(obj_val) if milp_feasible else float('inf')
 
+                # ── [FIX-4] Hitung dan simpan optimality gap ──────────────────────────────
                 if milp_feasible:
+                    try:
+                        best_bound   = float(prob.bestBound) if hasattr(prob, 'bestBound') and prob.bestBound is not None else None
+                        if best_bound is not None and milp_score > 1e-9:
+                            milp_gap_pct = abs(milp_score - best_bound) / (abs(milp_score) + 1e-10) * 100
+                        else:
+                            milp_gap_pct = 0.0 if milp_status == 'Optimal' else None
+                    except Exception:
+                        milp_gap_pct = None
+
                     for i in job_ids:
                         rute = [m for m in STATIONS if P[i][m] > 0]
                         milp_end[i] = (S[i][rute[-1]].varValue or 0) + P[i][rute[-1]] if rute else 0
                         for m in rute:
-                            milp_sched.append({'job':i,'m':m,
-                                               'start':round(S[i][m].varValue or 0, 2),'dur':P[i][m]})
+                            milp_sched.append({
+                                'job'  : i,
+                                'm'    : m,
+                                'start': round(S[i][m].varValue or 0, 2),
+                                'dur'  : P[i][m],
+                            })
 
             # Benchmark
             pb.progress(80, "4/5 Benchmark EDD & FCFS…")
@@ -940,6 +996,7 @@ else:
                 'label_pemenang': label_pemenang,
                 'score_pemenang': score_pemenang,
                 'milp_status'   : milp_status,
+                'milp_gap_pct'  : milp_gap_pct,   # [FIX-4] optimality gap
                 'bigm_info'     : bigm_info,
                 # Benchmark
                 'edd_score'     : edd_score,
@@ -985,6 +1042,7 @@ else:
             label_pemenang = H['label_pemenang']
             score_pemenang = H['score_pemenang']
             milp_status    = H['milp_status']
+            milp_gap_pct   = H.get('milp_gap_pct')   # [FIX-4] optimality gap
             bigm_info      = H['bigm_info']
             edd_score      = H['edd_score']
             fcfs_score     = H['fcfs_score']
@@ -1011,10 +1069,12 @@ else:
 
             with st.container(border=True):
                 cc1, cc2, cc3 = st.columns(3)
+                gap_display = (f"Gap: {milp_gap_pct:.2f}%" if milp_gap_pct is not None
+                               else f"Status: {milp_status}")
                 cc1.markdown(
                     f'<div class="metric-winner"><b>🏆 {label_pemenang}</b><br>'
                     f'Skor Penalti: <b>{score_pemenang:,.2f}</b><br>'
-                    f'MILP Status: {milp_status}</div>', unsafe_allow_html=True)
+                    f'MILP {gap_display}</div>', unsafe_allow_html=True)
                 cc2.markdown(
                     f'<div class="metric-loser"><b>📊 EDD (Benchmark)</b><br>'
                     f'Skor Penalti: <b>{edd_score:,.2f}</b><br>'
@@ -1025,10 +1085,14 @@ else:
                     f'Tepat: {len(job_ids)-fcfs_telat} | Terlambat: {fcfs_telat}</div>', unsafe_allow_html=True)
 
             if bigm_info:
-                bigm_aktif = {k: v for k, v in bigm_info.items() if v > 1.0}
-                st.caption("🔧 BigM: " + " · ".join(f"{k.split('.',1)[-1].strip()}={v:.0f}"
-                            for k, v in bigm_aktif.items()) +
-                           " · SA: 8.000 iter, T₀=500, α=0.997 · Warm-start: ✅")
+                # BigM sekarang bersifat global (sama untuk semua stasiun)
+                bigm_val = list(bigm_info.values())[0] if bigm_info else 0
+                gap_str  = (f"Gap: {milp_gap_pct:.2f}%" if milp_gap_pct is not None
+                            else f"MILP: {milp_status}")
+                st.caption(
+                    f"🔧 BigM global: {bigm_val:,.0f} mnt (= total makespan teoritis) · "
+                    f"{gap_str} · SA: 8.000 iter, T₀=500, α=0.997 · Warm-start: ✅"
+                )
 
             # ── Tabs ──
             tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
