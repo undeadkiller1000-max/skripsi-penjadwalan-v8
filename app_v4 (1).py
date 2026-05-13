@@ -866,35 +866,74 @@ else:
             bigm_info  = {}; milp_gap_pct = None
 
             if len(job_ids) >= 2:
-                prob     = pulp.LpProblem("JobShop_Garment", pulp.LpMinimize)
-                S        = pulp.LpVariable.dicts("S",    (job_ids, STATIONS), lowBound=0, cat='Continuous')
-                Tard_var = pulp.LpVariable.dicts("Tard", job_ids,             lowBound=0, cat='Continuous')
+                prob = pulp.LpProblem("JobShop_Garment", pulp.LpMinimize)
 
-                # ── [FIX-1] BigM GLOBAL = total makespan teoritis seluruh sistem ────────────
-                # Root cause infeasibility sebelumnya: BigM per-mesin (= sum durasi di mesin itu)
-                # terlalu kecil untuk mematikan disjunctive constraint ketika start time
-                # suatu job bernilai besar (job yang baru dimulai di hari ke-15 dst).
-                # BigM harus >= selisih start time MAKSIMUM yang mungkin di seluruh sistem,
-                # yaitu total waktu jika seluruh job diproses secara seri di semua stasiun.
-                # Rumus: BigM = Σᵢ Σₘ Pᵢₘ  (batas atas ketat makespan sistem)
-                BigM_global = max(
-                    sum(P[i][m] for i in job_ids for m in STATIONS),
-                    1.0
-                )
+                # ── [FIX-1] Buat index unik per job untuk nama variabel ───────────────────
+                # BUG KRITIS: safe_var_name() menyeragamkan karakter berbeda ke '_'.
+                # Jika ada ID seperti 'ORD-01' dan 'ORD.01', keduanya jadi 'ORD_01'
+                # → nama variabel DUPLIKAT → PuLP menimpa constraint → CBC Infeasible.
+                # Fix: gunakan index numerik sebagai prefix, bukan ID pesanan langsung.
+                job_idx = {j: f"j{k:03d}" for k, j in enumerate(job_ids)}
+
+                # ── [FIX-2] S hanya untuk (job, mesin) yang AKTIF ───────────────────────
+                # BUG: LpVariable.dicts("S", (job_ids, STATIONS)) membuat S[i][m]
+                # meski P[i][m]=0. Variabel bebas ini menambah noise numerik LP dan
+                # membuat LP relaxation lebih longgar → CBC lebih lambat / bisa trivial.
+                # Fix: buat S hanya untuk pasangan aktif menggunakan dict comprehension.
+                aktif_pairs = [(i, m) for i in job_ids for m in STATIONS if P[i][m] > 0]
+                S = {
+                    (i, m): pulp.LpVariable(
+                        f"S_{job_idx[i]}_{safe_var_name(m)}", lowBound=0, cat='Continuous'
+                    )
+                    for (i, m) in aktif_pairs
+                }
+                Tard_var = {
+                    i: pulp.LpVariable(f"Tard_{job_idx[i]}", lowBound=0, cat='Continuous')
+                    for i in job_ids
+                }
+
+                # ── [FIX-3] BigM per-mesin yang ketat — bukan BigM global ───────────────
+                # BUG: BigM global = total semua durasi → terlalu besar → constraint
+                # disjunctive sangat longgar → CBC menemukan "solusi trivial" di mana
+                # semua job mulai di t=0 dengan Y=1 → obj=0 → lolos obj_val check
+                # → TAPI gagal validasi overlap → milp_feasible di-reset False.
+                #
+                # BigM yang benar untuk mesin m:
+                # Hanya perlu cukup besar untuk mematikan constraint ketika job ke-2
+                # harus datang SETELAH job ke-1 selesai di mesin m.
+                # Batas atas start time job i di mesin m = sum(P[i][m'] untuk semua m')
+                # karena job i harus lewati semua stasiun sebelum m secara seri.
+                # Jadi: BigM[m] = max over semua job i,j aktif di m:
+                #   (sum semua P[i] di semua stasiun) + P[j][m]
+                # Ini jauh lebih kecil dari BigM global tapi tetap valid.
                 BigM = {}
+                bigm_info = {}
+                horizon_per_job = {
+                    i: sum(P[i][m] for m in STATIONS)
+                    for i in job_ids
+                }
                 for m in STATIONS:
-                    BigM[m]      = BigM_global
-                    bigm_info[m] = round(BigM_global, 1)
+                    aktif_m = [i for i in job_ids if P[i][m] > 0]
+                    if not aktif_m:
+                        BigM[m] = 1.0
+                    else:
+                        # BigM[m] = horizon terpanjang job mana pun + P terpanjang di mesin m
+                        # Ini cukup untuk: S[j][m] >= S[i][m] + P[i][m] - BigM[m]*Y
+                        # karena S[i][m] <= horizon_per_job[i] selalu terpenuhi
+                        bm = max(horizon_per_job[i] for i in aktif_m) + max(P[i][m] for i in aktif_m)
+                        BigM[m] = bm
+                    bigm_info[m] = round(BigM[m], 1)
 
                 # Variabel biner — hanya untuk pasangan yang benar-benar share mesin
                 Y = {}
                 for m in STATIONS:
-                    aktif = [i for i in job_ids if P[i][m] > 0]
-                    for a in range(len(aktif)):
-                        for b in range(a + 1, len(aktif)):
-                            i, j = aktif[a], aktif[b]
+                    aktif_m = [i for i in job_ids if P[i][m] > 0]
+                    for a in range(len(aktif_m)):
+                        for b in range(a + 1, len(aktif_m)):
+                            i, j = aktif_m[a], aktif_m[b]
+                            # Nama variabel menggunakan index numerik → tidak ada collision
                             Y[(i, j, m)] = pulp.LpVariable(
-                                f"Y_{safe_var_name(i)}_{safe_var_name(j)}_{safe_var_name(m)}",
+                                f"Y_{job_idx[i]}_{job_idx[j]}_{safe_var_name(m)}",
                                 cat='Binary')
 
                 # Objektif: minimasi total weighted tardiness
@@ -904,60 +943,68 @@ else:
                     rute = [m for m in STATIONS if P[i][m] > 0]
                     # Kendala presedensi (urutan stasiun dalam routing)
                     for k in range(1, len(rute)):
-                        prob += S[i][rute[k]] >= S[i][rute[k-1]] + P[i][rute[k-1]]
+                        prob += S[(i, rute[k])] >= S[(i, rute[k-1])] + P[i][rute[k-1]]
                     # Kendala tardiness
                     if rute:
-                        prob += Tard_var[i] >= (S[i][rute[-1]] + P[i][rute[-1]]) - D[i]
+                        prob += Tard_var[i] >= (S[(i, rute[-1])] + P[i][rute[-1]]) - D[i]
 
                 # Kendala kapasitas mesin (disjunctive / no-overlap)
                 for (i, j, m), y_var in Y.items():
                     bm = BigM[m]
-                    prob += S[j][m] >= S[i][m] + P[i][m] - bm * y_var
-                    prob += S[i][m] >= S[j][m] + P[j][m] - bm * (1 - y_var)
+                    prob += S[(j, m)] >= S[(i, m)] + P[i][m] - bm * y_var
+                    prob += S[(i, m)] >= S[(j, m)] + P[j][m] - bm * (1 - y_var)
 
-                # ── [FIX-2] Warm-start defensif dari solusi SA ────────────────────────────
-                # setInitialValue hanya dipanggil jika nilai ada DAN dalam domain variabel.
-                # Pengecekan ini mencegah CBC langsung melaporkan infeasible akibat
-                # starting point yang melanggar constraint (karena SA menggunakan logika
-                # greedy berbeda dari MILP).
+                # ── [FIX-4] Warm-start dari solusi SA ────────────────────────────────────
+                # Gunakan jadwal SA sebagai MIP start.
+                # S sudah dict dengan key (i,m) → akses langsung tanpa ambiguitas.
                 sa_map = {(e['job'], e['m']): e['start'] for e in sa_sched}
-                for i in job_ids:
-                    for m in STATIONS:
-                        v = sa_map.get((i, m))
-                        if v is not None and v >= 0:
-                            try:
-                                S[i][m].setInitialValue(float(v))
-                            except Exception:
-                                pass   # abaikan nilai yang tidak kompatibel
+                for (i, m) in aktif_pairs:
+                    v = sa_map.get((i, m))
+                    if v is not None and v >= 0:
+                        try:
+                            S[(i, m)].setInitialValue(float(v))
+                        except Exception:
+                            pass
                 for (i, j, m), y_var in Y.items():
                     si = sa_map.get((i, m))
                     sj = sa_map.get((j, m))
                     if si is not None and sj is not None:
                         try:
-                            y_var.setInitialValue(1 if float(sj) < float(si) else 0)
+                            # Y=0: i sebelum j (S[j]>=S[i]+P[i])
+                            # Y=1: j sebelum i (S[i]>=S[j]+P[j])
+                            y_var.setInitialValue(0 if float(si) <= float(sj) else 1)
                         except Exception:
                             pass
+                for i in job_ids:
+                    rute = [m for m in STATIONS if P[i][m] > 0]
+                    if rute:
+                        sa_start_last = sa_map.get((i, rute[-1]))
+                        if sa_start_last is not None:
+                            tard_hint = max(0.0, sa_start_last + P[i][rute[-1]] - D[i])
+                            try:
+                                Tard_var[i].setInitialValue(tard_hint)
+                            except Exception:
+                                pass
 
                 # ── Solve ─────────────────────────────────────────────────────────────────
                 prob.solve(pulp.PULP_CBC_CMD(
                     timeLimit=milp_time_limit,
-                    msg=0,          # ganti ke msg=1 untuk debug di terminal jika perlu
+                    msg=0,
                     warmStart=True,
                 ))
 
                 milp_status = pulp.LpStatus[prob.status]
                 obj_val     = pulp.value(prob.objective)
 
-                # ── [FIX-3] Cek feasibility yang lebih robust ─────────────────────────────
-                # obj_val is not None = CBC menemukan setidaknya 1 solusi integer feasible
-                # (berlaku baik saat Optimal maupun saat berhenti karena time limit)
+                # CBC menemukan feasible solution jika obj_val ada
+                # (berlaku saat Optimal maupun timeout-with-solution)
                 milp_feasible = obj_val is not None
                 milp_score    = float(obj_val) if milp_feasible else float('inf')
 
-                # ── [FIX-4] Hitung dan simpan optimality gap ──────────────────────────────
+                # Hitung optimality gap
                 if milp_feasible:
                     try:
-                        best_bound   = float(prob.bestBound) if hasattr(prob, 'bestBound') and prob.bestBound is not None else None
+                        best_bound = float(prob.bestBound) if hasattr(prob, 'bestBound') and prob.bestBound is not None else None
                         if best_bound is not None and milp_score > 1e-9:
                             milp_gap_pct = abs(milp_score - best_bound) / (abs(milp_score) + 1e-10) * 100
                         else:
@@ -965,16 +1012,7 @@ else:
                     except Exception:
                         milp_gap_pct = None
 
-                    # ── [FIX-A] Ekstrak varValue dan validasi kelayakan jadwal ─────────────
-                    # CBC kadang melaporkan obj_val=0 (feasible) tapi tidak menetapkan
-                    # nilai untuk variabel S[i][m] (varValue=None atau semuanya 0).
-                    # Ini terjadi karena BigM terlalu longgar sehingga constraint
-                    # disjunctive tidak mengikat dan solver menemukan "solusi trivial"
-                    # di mana semua job mulai di t=0.
-                    # Solusi: ekstrak varValue, lalu cek apakah jadwal yang dihasilkan
-                    # secara fisik valid (tidak ada overlap di setiap mesin).
-                    # Jika tidak valid → tolak jadwal MILP, biarkan SA menang.
-
+                    # ── Ekstrak jadwal dari varValue ──────────────────────────────────────
                     milp_sched_cand = []
                     milp_end_cand   = {}
 
@@ -983,24 +1021,26 @@ else:
                         if not rute:
                             milp_end_cand[i] = 0.0
                             continue
-                        max_end_i = 0.0
+                        # Waktu selesai job = end stasiun TERAKHIR dalam routing
+                        # (bukan max dari semua stasiun, karena routing adalah chain linear)
+                        last_m = rute[-1]
+                        raw_last = S[(i, last_m)].varValue
+                        s_last   = round(float(raw_last), 4) if raw_last is not None else 0.0
+                        milp_end_cand[i] = s_last + P[i][last_m]
+
                         for m in rute:
-                            raw   = S[i][m].varValue
+                            raw   = S[(i, m)].varValue
                             s_val = round(float(raw), 4) if raw is not None else 0.0
-                            end_m = s_val + P[i][m]
-                            if end_m > max_end_i:
-                                max_end_i = end_m
                             milp_sched_cand.append({
                                 'job'  : i,
                                 'm'    : m,
                                 'start': s_val,
                                 'dur'  : P[i][m],
                             })
-                        milp_end_cand[i] = max_end_i
 
-                    # Validasi: cek overlap mesin pada jadwal kandidat MILP
-                    # (sama persis dengan logika sanity check, tapi ringan dan lokal)
-                    MILP_TOL = 0.01
+                    # ── Validasi overlap mesin ────────────────────────────────────────────
+                    # Toleransi 1 menit untuk floating point CBC
+                    MILP_TOL  = 1.0
                     milp_valid = True
                     for stn in STATIONS:
                         tasks_stn = sorted(
@@ -1016,17 +1056,15 @@ else:
                             break
 
                     if milp_valid and milp_sched_cand:
-                        # Jadwal MILP valid → terima
                         milp_sched = milp_sched_cand
                         milp_end   = milp_end_cand
-                        # Hitung ulang skor aktual dari jadwal (bukan dari obj_val CBC
-                        # yang bisa menipu ketika varValue trivial)
+                        # Hitung ulang skor aktual (lebih akurat dari obj_val CBC)
                         milp_score = sum(
                             max(0.0, milp_end_cand[i] - D[i]) * W[i]
                             for i in job_ids
                         )
                     else:
-                        # Jadwal MILP tidak valid → tolak, SA yang akan menang
+                        # Jadwal tidak valid → SA menang
                         milp_feasible = False
                         milp_sched    = []
                         milp_end      = {}
